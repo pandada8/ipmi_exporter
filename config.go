@@ -78,7 +78,7 @@ func (s *IPMIConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 	for _, c := range s.Collectors {
-		if !(c == "ipmi" || c == "dcmi" || c == "bmc") {
+		if !(c == "ipmi" || c == "dcmi" || c == "bmc" || c == "ipmitool") {
 			return fmt.Errorf("unknown collector name: %s", c)
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"os"
 	"os/exec"
@@ -70,6 +71,13 @@ var (
 
 	fanSpeedDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "fan_speed", "rpm"),
+		"Fan speed in rotations per minute.",
+		[]string{"id", "name"},
+		nil,
+	)
+
+	fanSpeedPercentDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "fan_speed", "percent"),
 		"Fan speed in rotations per minute.",
 		[]string{"id", "name"},
 		nil,
@@ -240,6 +248,27 @@ func ipmiMonitoringOutput(target ipmiTarget) ([]byte, error) {
 	return freeipmiOutput("ipmimonitoring", target, "-Q", "--comma-separated-output", "--no-header-output", "--sdr-cache-recreate")
 }
 
+func ipmiToolOutput(target ipmiTarget) ([]byte, error) {
+	passfile, err := ioutil.TempFile("/dev/shm", "password")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(passfile.Name())
+	if _, err := passfile.Write([]byte(target.config.Password)); err != nil {
+		return nil, err
+	}
+	if err := passfile.Close(); err != nil {
+		return nil, err
+	}
+	args := []string{"sdr", "list", "-U", target.config.User, "-H", target.host, "-f", passfile.Name(), "-I", "lanplus"}
+	log.Debugf("Executing ipmitool %v", args)
+	out, err := exec.Command("ipmitool", args...).CombinedOutput()
+	if err != nil {
+		log.Errorf("Error while calling ipmitool for %s: %s", targetName(target.host), out)
+	}
+	return out, err
+}
+
 func ipmiDCMIOutput(target ipmiTarget) ([]byte, error) {
 	return freeipmiOutput("ipmi-dcmi", target, "--get-system-power-statistics")
 }
@@ -400,7 +429,6 @@ func collectMonitoring(ch chan<- prometheus.Metric, target ipmiTarget) (int, err
 		}
 
 		log.Debugf("Got values: %v\n", data)
-
 		switch data.Unit {
 		case "RPM":
 			collectTypedSensor(ch, fanSpeedDesc, fanSpeedStateDesc, state, data)
@@ -463,6 +491,65 @@ func collectBmcInfo(ch chan<- prometheus.Metric, target ipmiTarget) (int, error)
 	return 1, nil
 }
 
+var idNameRegex = regexp.MustCompile(`(\d*)-(.*)`)
+var numberSuffixRegex = regexp.MustCompile(`([.\d]*) (degrees C|percent|Watts)`)
+
+func collectIpmitool(ch chan<- prometheus.Metric, target ipmiTarget) (int, error) {
+	output, err := ipmiToolOutput(target)
+	if err != nil {
+		log.Errorf("Failed to collect ipmimonitoring data from %s: %s", targetName(target.host), err)
+		return 0, err
+	}
+	excludeIds := target.config.ExcludeSensorIDs
+	for _, line := range strings.Split(string(output), "\n") {
+		lineData := strings.Split(line, "|")
+		for i := range lineData {
+			lineData[i] = strings.TrimSpace(lineData[i])
+		}
+		if len(lineData) == 3 {
+			data := sensorData{}
+			data.Name = lineData[0]
+			subs := idNameRegex.FindStringSubmatch(data.Name)
+			if len(subs) == 3 {
+				data.ID, _ = strconv.ParseInt(subs[1], 10, 64)
+				if contains(excludeIds, data.ID) {
+					continue
+				}
+				data.Name = subs[2]
+			}
+
+			data.Event = lineData[1]
+			subs = numberSuffixRegex.FindStringSubmatch(data.Event)
+			if len(subs) == 3 {
+				data.Value, _ = strconv.ParseFloat(subs[1], 64)
+				data.Unit = subs[2]
+			}
+
+			var state float64
+			switch lineData[2] {
+			case "ok":
+				state = 0
+			case "ns":
+				state = math.NaN()
+			// FIXME:
+			default:
+				state = 1
+			}
+			// fmt.Println(data, state)
+			if data.Unit == "Watts" {
+				collectTypedSensor(ch, powerDesc, powerStateDesc, state, data)
+			} else if data.Unit == "percent" {
+				collectTypedSensor(ch, fanSpeedPercentDesc, fanSpeedStateDesc, state, data)
+			} else if data.Unit == "degrees C" {
+				collectTypedSensor(ch, temperatureDesc, temperatureStateDesc, state, data)
+			} else {
+				collectGenericSensor(ch, state, data)
+			}
+		}
+	}
+	return 1, nil
+}
+
 func markCollectorUp(ch chan<- prometheus.Metric, name string, up int) {
 	ch <- prometheus.MustNewConstMetric(
 		upDesc,
@@ -501,6 +588,8 @@ func (c collector) Collect(ch chan<- prometheus.Metric) {
 			up, _ = collectDCMI(ch, target)
 		case "bmc":
 			up, _ = collectBmcInfo(ch, target)
+		case "ipmitool":
+			up, _ = collectIpmitool(ch, target)
 		}
 		markCollectorUp(ch, collector, up)
 	}
